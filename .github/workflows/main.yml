@@ -1,0 +1,118 @@
+name: build-from-zip
+
+# Кладёшь проект (zip или уже распакованный) в репозиторий и пушишь.
+# Workflow сам найдёт проект, подберёт Java/Gradle и соберёт jar.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find project (unpack zip if needed)
+        id: src
+        shell: bash
+        run: |
+          set -e
+          DIR=""
+          if [ -f build.gradle ] || [ -f build.gradle.kts ] || [ -f pom.xml ]; then
+            DIR="."
+            echo "Проект уже распакован в корне репозитория"
+          else
+            ZIP=$(ls -t ./*.zip 2>/dev/null | head -n1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "::error::Нет ни проекта в корне, ни .zip файла"; exit 1
+            fi
+            echo "Распаковываю $ZIP"
+            rm -rf _src && mkdir _src
+            unzip -q -o "$ZIP" -d _src
+            F=$(find _src -maxdepth 4 -not -path '*/__MACOSX/*' \
+                \( -name build.gradle -o -name build.gradle.kts -o -name pom.xml \) \
+                | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+            if [ -z "$F" ]; then
+              echo "::error::В zip нет build.gradle / build.gradle.kts / pom.xml"; exit 1
+            fi
+            DIR=$(dirname "$F")
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+          # --- сборочная система ---
+          if [ -f "$DIR/pom.xml" ] && [ ! -f "$DIR/build.gradle" ] && [ ! -f "$DIR/build.gradle.kts" ]; then
+            TOOL=maven
+          else
+            TOOL=gradle
+          fi
+          echo "tool=$TOOL" >> "$GITHUB_OUTPUT"
+
+          # --- версия Java ---
+          JAVA=17
+          MC=$(grep -hs '^minecraft_version' "$DIR/gradle.properties" | head -n1 | cut -d= -f2 | tr -d ' \r')
+          case "$MC" in
+            1.20.[5-9]*|1.21*|26*) JAVA=21 ;;
+          esac
+          if grep -qsE 'VERSION_21|languageVersion.*21|release.*21|<java.version>21|1\.21\.' \
+               "$DIR/build.gradle" "$DIR/build.gradle.kts" "$DIR/pom.xml" "$DIR/gradle.properties"; then
+            JAVA=21
+          fi
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+
+          # --- версия Gradle (без wrapper-jar) ---
+          GV=""
+          if [ -f "$DIR/gradle/wrapper/gradle-wrapper.properties" ]; then
+            GV=$(grep -o 'gradle-[0-9.]*' "$DIR/gradle/wrapper/gradle-wrapper.properties" | head -n1 | sed 's/gradle-//; s/\.$//')
+          fi
+          if [ -z "$GV" ]; then
+            if [ "$JAVA" = "21" ]; then GV=8.10.2; else GV=8.5; fi
+          fi
+          echo "gradle=$GV" >> "$GITHUB_OUTPUT"
+          if [ -f "$DIR/gradlew" ] && [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "wrapper=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "wrapper=no" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Итог: dir=$DIR tool=$TOOL java=$JAVA gradle=$GV"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.src.outputs.java }}
+
+      - name: Set up Gradle
+        if: steps.src.outputs.tool == 'gradle' && steps.src.outputs.wrapper == 'no'
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ steps.src.outputs.gradle }}
+
+      - name: Build (Gradle wrapper)
+        if: steps.src.outputs.tool == 'gradle' && steps.src.outputs.wrapper == 'yes'
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - name: Build (Gradle)
+        if: steps.src.outputs.tool == 'gradle' && steps.src.outputs.wrapper == 'no'
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: gradle build --no-daemon
+
+      - name: Build (Maven)
+        if: steps.src.outputs.tool == 'maven'
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: mvn -B package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-jar
+          if-no-files-found: error
+          path: |
+            ${{ steps.src.outputs.dir }}/build/libs/*.jar
+            ${{ steps.src.outputs.dir }}/target/*.jar
+            !${{ steps.src.outputs.dir }}/**/*-sources.jar
+            !${{ steps.src.outputs.dir }}/**/*-javadoc.jar
+            !${{ steps.src.outputs.dir }}/**/original-*.jar
